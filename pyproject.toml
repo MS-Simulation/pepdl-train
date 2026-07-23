@@ -13,5 +13,8 @@ dependencies = ["pepdl @ git+https://github.com/theGreatHerrLebert/pepdl.git", "
 [project.optional-dependencies]
 sagepy = ["sagepy>=0.3"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/pepdl_train"]
