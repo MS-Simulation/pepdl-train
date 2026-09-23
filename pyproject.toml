@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Training for pepdl peptide DL predictors — datasets, training loops, losses. Separate from the lean pepdl inference package."
 requires-python = ">=3.11"
 license = { text = "MIT" }
-dependencies = ["pepdl @ git+https://github.com/MS-Simulation/pepdl.git", "torch>=2.0", "datasets>=2.0", "tensorboard", "numpy", "pandas"]
+dependencies = ["pepdl @ git+https://github.com/MS-Simulation/pepdl.git@75420c5cbc878130ea7034a1b6e32eb23a73fc25", "torch>=2.0", "datasets>=2.0", "tensorboard", "numpy", "pandas"]
 
 [project.optional-dependencies]
 sagepy = ["sagepy>=0.3"]
