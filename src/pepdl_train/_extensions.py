@@ -1,12 +1,42 @@
 """pepdl-train extensions — re-attach the training methods (fine_tune*) that were extracted out of the
 pepdl INFERENCE package (so inference imports nothing training). Importing pepdl_train monkeypatches
-them back onto the predictor classes; the bodies lazy-import torch/datasets/sagepy so attaching is
-cheap. Provenance: method bodies verbatim from imspy-predictors (self-bound, pepdl.losses->pepdl_train.losses)."""
+them back onto the predictor classes. Provenance: method bodies from imspy-predictors (self-bound,
+pepdl.losses->pepdl_train.losses).
+
+The bodies were copied without their module's imports, so every fine_tune_* raised NameError on its
+first line of real work; the imports below are that module context, made explicit. torch is a
+declared dependency of pepdl-train, so importing it here costs nothing the package did not already
+require. Every forward call passes the padding mask the models were trained with (pepdl#2) and,
+for intensity, the predictor's instrument (pepdl#3)."""
 from __future__ import annotations
 
-from pepdl.ccs.predictors import DeepPeptideIonMobilityApex
+import warnings
+from typing import List
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from numpy.typing import NDArray
+
+from pepdl._vendored import calculate_mz, one_over_k0_to_ccs
+from pepdl.ccs.predictors import DeepPeptideIonMobilityApex, _extract_prediction_mean
+from pepdl.intensity.predictors import (
+    DeepPeptideIntensityPredictor,
+    observed_fragments_to_intensity_target,
+)
 from pepdl.rt.predictors import DeepChromatographyApex
-from pepdl.intensity.predictors import DeepPeptideIntensityPredictor
+from pepdl.utility import InMemoryCheckpoint
+
+def _instrument_kwargs(self, tokens):
+    """The predictor's instrument (pepdl#3) for a fine-tune forward call, so fine-tuning sees the
+    same inputs as prediction; nothing when the predictor has none (the model's "unknown")."""
+    instrument_id = getattr(self, "instrument_id", None)
+    if instrument_id is None:
+        return {}
+    return {"instrument": self._torch.full(
+        (tokens.shape[0],), instrument_id, dtype=self._torch.long, device=tokens.device)}
+
 
 def _DeepPeptideIonMobilityApex_fine_tune_model(
     self,
@@ -93,7 +123,8 @@ def _DeepPeptideIonMobilityApex_fine_tune_model(
     ])
 
     # Prepare data
-    tokens = self._preprocess_sequences(sequences)
+    # The padding mask the model was trained with goes to every forward call (pepdl#2).
+    tokens, pad_mask = self._preprocess_sequences(sequences)
     mz_tensor = torch.tensor(mz, dtype=torch.float32, device=self._device)
     charges_onehot = F.one_hot(
         torch.tensor(charges, dtype=torch.long, device=self._device) - 1,
@@ -130,12 +161,14 @@ def _DeepPeptideIonMobilityApex_fine_tune_model(
         mz_tensor[train_idx],
         charges_onehot[train_idx],
         tokens[train_idx],
+        pad_mask[train_idx],
         ccs_tensor[train_idx],
     )
     val_dataset = TensorDataset(
         mz_tensor[val_idx],
         charges_onehot[val_idx],
         tokens[val_idx],
+        pad_mask[val_idx],
         ccs_tensor[val_idx],
     )
 
@@ -156,7 +189,7 @@ def _DeepPeptideIonMobilityApex_fine_tune_model(
         self.model.train()
         train_loss = 0
         for batch in train_loader:
-            mz_b, charge_b, tokens_b, ccs_b = batch
+            mz_b, charge_b, tokens_b, mask_b, ccs_b = batch
             optimizer.zero_grad()
 
             # Handle different model types
@@ -165,9 +198,10 @@ def _DeepPeptideIonMobilityApex_fine_tune_model(
                     tokens_b,
                     mz_b,
                     torch.argmax(charge_b, dim=1) + 1,
+                    padding_mask=mask_b,
                 )
             else:
-                pred = self.model(mz_b, charge_b, tokens_b)
+                pred = self.model(mz_b, charge_b, tokens_b, padding_mask=mask_b)
             pred = _extract_prediction_mean(pred, "ccs")
 
             loss = F.l1_loss(pred, ccs_b)
@@ -181,16 +215,17 @@ def _DeepPeptideIonMobilityApex_fine_tune_model(
         val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
-                mz_b, charge_b, tokens_b, ccs_b = batch
+                mz_b, charge_b, tokens_b, mask_b, ccs_b = batch
 
                 if hasattr(self.model, 'predict_ccs'):
                     pred = self.model.predict_ccs(
                         tokens_b,
                         mz_b,
                         torch.argmax(charge_b, dim=1) + 1,
+                        padding_mask=mask_b,
                     )
                 else:
-                    pred = self.model(mz_b, charge_b, tokens_b)
+                    pred = self.model(mz_b, charge_b, tokens_b, padding_mask=mask_b)
                 pred = _extract_prediction_mean(pred, "ccs")
 
                 val_loss += F.l1_loss(pred, ccs_b).item()
@@ -270,15 +305,18 @@ def _DeepChromatographyApex__fine_tune(
     """PyTorch fine-tuning."""
     from torch.utils.data import DataLoader, TensorDataset
 
-    tokens = self._preprocess_sequences(sequences)
+    # The padding mask the model was trained with goes to every forward call (pepdl#2).
+    tokens, pad_mask = self._preprocess_sequences(sequences)
     rt_tensor = torch.tensor(rts, dtype=torch.float32, device=self._device).unsqueeze(1)
 
     n = len(sequences)
     n_train = int(0.8 * n)
     indices = torch.randperm(n)
 
-    train_dataset = TensorDataset(tokens[indices[:n_train]], rt_tensor[indices[:n_train]])
-    val_dataset = TensorDataset(tokens[indices[n_train:]], rt_tensor[indices[n_train:]])
+    train_dataset = TensorDataset(tokens[indices[:n_train]], pad_mask[indices[:n_train]],
+                                  rt_tensor[indices[:n_train]])
+    val_dataset = TensorDataset(tokens[indices[n_train:]], pad_mask[indices[n_train:]],
+                                rt_tensor[indices[n_train:]])
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
@@ -292,9 +330,9 @@ def _DeepChromatographyApex__fine_tune(
     for epoch in range(epochs):
         self.model.train()
         train_loss = 0.0
-        for tokens_b, rt_b in train_loader:
+        for tokens_b, mask_b, rt_b in train_loader:
             optimizer.zero_grad()
-            pred = _extract_prediction_mean(self.model(tokens_b), "rt")
+            pred = _extract_prediction_mean(self.model(tokens_b, padding_mask=mask_b), "rt")
             loss = F.l1_loss(pred, rt_b)
             loss.backward()
             optimizer.step()
@@ -304,8 +342,8 @@ def _DeepChromatographyApex__fine_tune(
         self.model.eval()
         val_loss = 0
         with torch.no_grad():
-            for tokens_b, rt_b in val_loader:
-                pred = _extract_prediction_mean(self.model(tokens_b), "rt")
+            for tokens_b, mask_b, rt_b in val_loader:
+                pred = _extract_prediction_mean(self.model(tokens_b, padding_mask=mask_b), "rt")
                 val_loss += F.l1_loss(pred, rt_b).item()
         val_loss /= max(len(val_loader), 1)
         scheduler.step(val_loss)
@@ -372,12 +410,14 @@ def _DeepPeptideIntensityPredictor_fine_tune_model(
     if targets.shape != (len(data), 174):
         raise ValueError(f"intensity_target must have shape (n, 174), got {targets.shape}")
 
-    tokens, charge_tensor, ce_tensor = self._preprocess(
+    # The padding mask the model was trained with goes to every forward call (pepdl#2).
+    tokens, pad_mask, charge_tensor, ce_tensor = self._preprocess(
         sequences,
         charges,
         collision_energies,
     )
     tokens = tokens.to(self._device)
+    pad_mask = pad_mask.to(self._device)
     charge_tensor = charge_tensor.to(self._device)
     ce_tensor = ce_tensor.to(self._device)
     target_tensor = self._torch.tensor(targets, dtype=self._torch.float32, device=self._device)
@@ -392,12 +432,14 @@ def _DeepPeptideIntensityPredictor_fine_tune_model(
 
     train_dataset = TensorDataset(
         tokens[train_idx],
+        pad_mask[train_idx],
         charge_tensor[train_idx],
         ce_tensor[train_idx],
         target_tensor[train_idx],
     )
     val_dataset = TensorDataset(
         tokens[val_idx],
+        pad_mask[val_idx],
         charge_tensor[val_idx],
         ce_tensor[val_idx],
         target_tensor[val_idx],
@@ -417,12 +459,13 @@ def _DeepPeptideIntensityPredictor_fine_tune_model(
     for epoch in range(epochs):
         self.model.train()
         train_loss = 0.0
-        for tokens_b, charge_b, ce_b, target_b in train_loader:
+        for tokens_b, mask_b, charge_b, ce_b, target_b in train_loader:
             optimizer.zero_grad()
             outputs = self.model(
                 tokens_b,
                 charge=charge_b,
-                collision_energy=ce_b,
+                collision_energy=ce_b, padding_mask=mask_b,
+                **_instrument_kwargs(self, tokens_b),
             )
             pred = outputs['intensity'] if 'intensity' in outputs else list(outputs.values())[0]
             loss = masked_spectral_distance(target_b, pred)
@@ -434,11 +477,12 @@ def _DeepPeptideIntensityPredictor_fine_tune_model(
         self.model.eval()
         val_loss = 0.0
         with self._torch.no_grad():
-            for tokens_b, charge_b, ce_b, target_b in val_loader:
+            for tokens_b, mask_b, charge_b, ce_b, target_b in val_loader:
                 outputs = self.model(
                     tokens_b,
                     charge=charge_b,
-                    collision_energy=ce_b,
+                    collision_energy=ce_b, padding_mask=mask_b,
+                    **_instrument_kwargs(self, tokens_b),
                 )
                 pred = outputs['intensity'] if 'intensity' in outputs else list(outputs.values())[0]
                 val_loss += masked_spectral_distance(target_b, pred).item()
@@ -550,10 +594,12 @@ def _DeepPeptideIntensityPredictor_fine_tune_model_v2(
             f"intensity_target must have shape (n, 174), got {targets.shape}"
         )
 
-    tokens, charge_tensor, ce_tensor = self._preprocess(
+    # The padding mask the model was trained with goes to every forward call (pepdl#2).
+    tokens, pad_mask, charge_tensor, ce_tensor = self._preprocess(
         sequences, charges, collision_energies,
     )
     tokens = tokens.to(self._device)
+    pad_mask = pad_mask.to(self._device)
     charge_tensor = charge_tensor.to(self._device)
     ce_tensor = ce_tensor.to(self._device)
     target_tensor = self._torch.tensor(
@@ -585,11 +631,11 @@ def _DeepPeptideIntensityPredictor_fine_tune_model_v2(
               f"(val groups: {n_val_groups:,})")
 
     train_ds = TensorDataset(
-        tokens[train_idx], charge_tensor[train_idx],
+        tokens[train_idx], pad_mask[train_idx], charge_tensor[train_idx],
         ce_tensor[train_idx], target_tensor[train_idx],
     )
     val_ds = TensorDataset(
-        tokens[val_idx], charge_tensor[val_idx],
+        tokens[val_idx], pad_mask[val_idx], charge_tensor[val_idx],
         ce_tensor[val_idx], target_tensor[val_idx],
     )
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
@@ -606,10 +652,11 @@ def _DeepPeptideIntensityPredictor_fine_tune_model_v2(
     for epoch in range(epochs):
         self.model.train()
         train_loss = 0.0
-        for tokens_b, charge_b, ce_b, target_b in train_loader:
+        for tokens_b, mask_b, charge_b, ce_b, target_b in train_loader:
             optimizer.zero_grad()
             outputs = self.model(
-                tokens_b, charge=charge_b, collision_energy=ce_b,
+                tokens_b, charge=charge_b, collision_energy=ce_b, padding_mask=mask_b,
+                **_instrument_kwargs(self, tokens_b),
             )
             pred = (outputs['intensity'] if 'intensity' in outputs
                       else list(outputs.values())[0])
@@ -622,9 +669,10 @@ def _DeepPeptideIntensityPredictor_fine_tune_model_v2(
         self.model.eval()
         val_loss = 0.0
         with self._torch.no_grad():
-            for tokens_b, charge_b, ce_b, target_b in val_loader:
+            for tokens_b, mask_b, charge_b, ce_b, target_b in val_loader:
                 outputs = self.model(
-                    tokens_b, charge=charge_b, collision_energy=ce_b,
+                    tokens_b, charge=charge_b, collision_energy=ce_b, padding_mask=mask_b,
+                    **_instrument_kwargs(self, tokens_b),
                 )
                 pred = (outputs['intensity'] if 'intensity' in outputs
                           else list(outputs.values())[0])
